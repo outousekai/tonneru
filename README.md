@@ -30,9 +30,9 @@ func main() {
     config := bore.ClientConfig{
         LocalHost:  "localhost", // 本地服务地址
         LocalPort:  8080,        // 本地服务端口
-        RemoteHost: "sssh.hpc.pub", // 远程服务器地址
+        RemoteHost: "your-server.com", // 远程服务器地址
         RemotePort: 0,           // 0表示让服务器分配端口
-        Secret:     "hpc.pub",   // 认证密钥（可选）
+        Secret:     "your-secret",   // 认证密钥（可选）
         BindIP:     "0.0.0.0",   // 服务器绑定IP（可选）
     }
 
@@ -68,7 +68,7 @@ func main() {
 config := bore.ClientConfig{
     LocalHost:  "localhost",
     LocalPort:  3000,
-    RemoteHost: "sssh.hpc.pub",
+    RemoteHost: "your-server.com",
     RemotePort: 0,
     // 不设置Secret，表示不使用认证
     BindIP: "127.0.0.1",
@@ -81,9 +81,9 @@ config := bore.ClientConfig{
 config := bore.ClientConfig{
     LocalHost:  "localhost",
     LocalPort:  9000,
-    RemoteHost: "sssh.hpc.pub",
+    RemoteHost: "your-server.com",
     RemotePort: 12345, // 指定远程端口
-    Secret:     "hpc.pub",
+    Secret:     "your-secret",
     BindIP:     "0.0.0.0",
 }
 ```

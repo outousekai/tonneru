@@ -24,12 +24,14 @@ const (
 
 // ClientConfig 客户端配置
 type ClientConfig struct {
-	LocalHost  string // 本地服务地址
-	LocalPort  int    // 本地服务端口
-	RemoteHost string // 远程服务器地址
-	RemotePort int    // 0表示让服务器分配端口
-	Secret     string // 认证密钥（可选）
-	BindIP     string // 服务器绑定IP（可选）
+	LocalHost  string        // 本地服务地址
+	LocalPort  int           // 本地服务端口
+	RemoteHost string        // 远程服务器地址
+	RemotePort int           // 0表示让服务器分配端口
+	Secret     string        // 认证密钥（可选）
+	BindIP     string        // 服务器绑定IP（可选）
+	RetryCount int           // 重连次数，0表示无限重连
+	RetryDelay time.Duration // 重连延迟时间，最低1秒
 }
 
 // Client 客户端结构体
@@ -39,10 +41,18 @@ type Client struct {
 	remotePort int
 	auth       *Authenticator
 	mu         sync.RWMutex
+	retryCount int // 当前重连次数
 }
 
 // NewClient 创建新的客户端
 func NewClient(config ClientConfig) (*Client, error) {
+	// 设置默认值
+	if config.RetryDelay == 0 {
+		config.RetryDelay = 1 * time.Second
+	} else if config.RetryDelay < 1*time.Second {
+		config.RetryDelay = 1 * time.Second
+	}
+
 	client := &Client{
 		config: config,
 	}
@@ -54,8 +64,43 @@ func NewClient(config ClientConfig) (*Client, error) {
 	return client, nil
 }
 
-// Connect 连接到服务器
+// Connect 连接到服务器（带重连机制）
 func (c *Client) Connect(ctx context.Context) error {
+	for {
+		// 检查重连次数限制
+		if c.config.RetryCount > 0 && c.retryCount >= c.config.RetryCount {
+			return fmt.Errorf("已达到最大重连次数 %d", c.config.RetryCount)
+		}
+
+		// 尝试连接
+		err := c.connectOnce()
+		if err == nil {
+			// 连接成功，重置重连计数
+			c.mu.Lock()
+			c.retryCount = 0
+			c.mu.Unlock()
+			return nil
+		}
+
+		// 连接失败，增加重连计数
+		c.mu.Lock()
+		c.retryCount++
+		c.mu.Unlock()
+
+		fmt.Printf("连接失败 (第 %d 次尝试): %v\n", c.retryCount, err)
+
+		// 等待重连延迟
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(c.config.RetryDelay):
+			continue
+		}
+	}
+}
+
+// connectOnce 执行单次连接
+func (c *Client) connectOnce() error {
 	// 连接到控制端口
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", c.config.RemoteHost, ControlPort), NetworkTimeout)
 	if err != nil {
@@ -132,7 +177,13 @@ func (c *Client) Listen(ctx context.Context) error {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
 				}
-				return fmt.Errorf("接收消息失败: %w", err)
+
+				// 连接断开，尝试重连
+				fmt.Printf("连接断开，尝试重连: %v\n", err)
+				if err := c.reconnect(ctx); err != nil {
+					return fmt.Errorf("重连失败: %w", err)
+				}
+				continue
 			}
 
 			if serverMsg.Heartbeat != nil {
@@ -142,12 +193,29 @@ func (c *Client) Listen(ctx context.Context) error {
 				// 新连接请求
 				go c.handleConnection(*serverMsg.Connection)
 			} else if serverMsg.Error != nil {
-				return fmt.Errorf("服务器错误: %s", *serverMsg.Error)
+				// 服务器错误，尝试重连
+				fmt.Printf("服务器错误，尝试重连: %s\n", *serverMsg.Error)
+				if err := c.reconnect(ctx); err != nil {
+					return fmt.Errorf("重连失败: %w", err)
+				}
+				continue
 			} else {
 				fmt.Printf("意外的服务器消息: %+v\n", serverMsg)
 			}
 		}
 	}
+}
+
+// reconnect 重连到服务器
+func (c *Client) reconnect(ctx context.Context) error {
+	// 关闭当前连接
+	if c.conn != nil {
+		c.conn.Close()
+		c.conn = nil
+	}
+
+	// 使用Connect方法重连（会自动处理重连逻辑）
+	return c.Connect(ctx)
 }
 
 // handleConnection 处理单个代理连接
