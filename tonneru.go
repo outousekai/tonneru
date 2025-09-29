@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -32,6 +33,7 @@ type ClientConfig struct {
 	BindIP     string        // 服务器绑定IP（可选）
 	RetryCount int           // 重连次数，0表示无限重连
 	RetryDelay time.Duration // 重连延迟时间，最低1秒
+	Logger     *slog.Logger  // 日志记录器（可选）
 }
 
 // Client 客户端结构体
@@ -64,6 +66,27 @@ func NewClient(config ClientConfig) (*Client, error) {
 	return client, nil
 }
 
+// logInfo 记录信息日志
+func (c *Client) logInfo(msg string, args ...any) {
+	if c.config.Logger != nil {
+		c.config.Logger.Info(msg, args...)
+	}
+}
+
+// logError 记录错误日志
+func (c *Client) logError(msg string, args ...any) {
+	if c.config.Logger != nil {
+		c.config.Logger.Error(msg, args...)
+	}
+}
+
+// logDebug 记录调试日志
+func (c *Client) logDebug(msg string, args ...any) {
+	if c.config.Logger != nil {
+		c.config.Logger.Debug(msg, args...)
+	}
+}
+
 // Connect 连接到服务器（带重连机制）
 func (c *Client) Connect(ctx context.Context) error {
 	for {
@@ -87,7 +110,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		c.retryCount++
 		c.mu.Unlock()
 
-		fmt.Printf("连接失败 (第 %d 次尝试): %v\n", c.retryCount, err)
+		c.logError("连接失败", "attempt", c.retryCount, "error", err)
 
 		// 等待重连延迟
 		select {
@@ -142,10 +165,7 @@ func (c *Client) connectOnce() error {
 
 	if serverMsg.Hello != nil {
 		c.remotePort = *serverMsg.Hello
-		fmt.Printf("本地服务 %s:%d ==> 远程地址 %s:%d <== %s\n",
-			c.config.LocalHost, c.config.LocalPort,
-			c.config.RemoteHost, c.remotePort,
-			c.config.BindIP)
+		c.logInfo("连接成功", "local", fmt.Sprintf("%s:%d", c.config.LocalHost, c.config.LocalPort), "remote", fmt.Sprintf("%s:%d", c.config.RemoteHost, c.remotePort), "bind_ip", c.config.BindIP)
 	} else if serverMsg.Error != nil {
 		conn.Close()
 		return fmt.Errorf("服务器错误: %s", *serverMsg.Error)
@@ -179,7 +199,7 @@ func (c *Client) Listen(ctx context.Context) error {
 				}
 
 				// 连接断开，尝试重连
-				fmt.Printf("连接断开，尝试重连: %v\n", err)
+				c.logError("连接断开，尝试重连", "error", err)
 				if err := c.reconnect(ctx); err != nil {
 					return fmt.Errorf("重连失败: %w", err)
 				}
@@ -194,13 +214,13 @@ func (c *Client) Listen(ctx context.Context) error {
 				go c.handleConnection(*serverMsg.Connection)
 			} else if serverMsg.Error != nil {
 				// 服务器错误，尝试重连
-				fmt.Printf("服务器错误，尝试重连: %s\n", *serverMsg.Error)
+				c.logError("服务器错误，尝试重连", "error", *serverMsg.Error)
 				if err := c.reconnect(ctx); err != nil {
 					return fmt.Errorf("重连失败: %w", err)
 				}
 				continue
 			} else {
-				fmt.Printf("意外的服务器消息: %+v\n", serverMsg)
+				c.logDebug("意外的服务器消息", "message", serverMsg)
 			}
 		}
 	}
@@ -223,7 +243,7 @@ func (c *Client) handleConnection(connectionID uuid.UUID) {
 	// 连接到控制端口
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", c.config.RemoteHost, ControlPort), NetworkTimeout)
 	if err != nil {
-		fmt.Printf("无法连接到服务器进行代理: %v\n", err)
+		c.logError("无法连接到服务器进行代理", "error", err)
 		return
 	}
 	defer conn.Close()
@@ -231,7 +251,7 @@ func (c *Client) handleConnection(connectionID uuid.UUID) {
 	// 进行认证握手
 	if c.auth != nil {
 		if err := c.auth.ClientHandshake(conn); err != nil {
-			fmt.Printf("代理连接认证失败: %v\n", err)
+			c.logError("代理连接认证失败", "error", err)
 			return
 		}
 	}
@@ -242,19 +262,19 @@ func (c *Client) handleConnection(connectionID uuid.UUID) {
 	}
 
 	if err := c.sendMessageToConn(conn, acceptMsg); err != nil {
-		fmt.Printf("发送Accept消息失败: %v\n", err)
+		c.logError("发送Accept消息失败", "error", err)
 		return
 	}
 
 	// 连接到本地服务
 	localConn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", c.config.LocalHost, c.config.LocalPort), NetworkTimeout)
 	if err != nil {
-		fmt.Printf("无法连接到本地服务: %v\n", err)
+		c.logError("无法连接到本地服务", "error", err)
 		return
 	}
 	defer localConn.Close()
 
-	fmt.Printf("新连接建立，开始代理数据\n")
+	c.logInfo("新连接建立，开始代理数据")
 
 	// 开始代理数据
 	c.proxy(localConn, conn)
