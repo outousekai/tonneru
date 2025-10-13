@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"sync"
@@ -34,6 +33,12 @@ type ClientConfig struct {
 	RetryCount int           // 重连次数，0表示无限重连
 	RetryDelay time.Duration // 重连延迟时间，最低1秒
 	Logger     *slog.Logger  // 日志记录器（可选）
+	// 缓冲区配置
+	BufferSize    int           // 缓冲区大小，默认64KB
+	ReadTimeout   time.Duration // 读取超时时间
+	WriteTimeout  time.Duration // 写入超时时间
+	KeepAlive     bool          // 是否启用TCP Keep-Alive
+	KeepAliveTime time.Duration // Keep-Alive间隔时间
 }
 
 // Client 客户端结构体
@@ -53,6 +58,20 @@ func NewClient(config ClientConfig) (*Client, error) {
 		config.RetryDelay = 1 * time.Second
 	} else if config.RetryDelay < 1*time.Second {
 		config.RetryDelay = 1 * time.Second
+	}
+
+	// 设置缓冲区默认值
+	if config.BufferSize == 0 {
+		config.BufferSize = 256 * 1024 // 64KB
+	}
+	if config.ReadTimeout == 0 {
+		config.ReadTimeout = 30 * time.Second
+	}
+	if config.WriteTimeout == 0 {
+		config.WriteTimeout = 30 * time.Second
+	}
+	if config.KeepAliveTime == 0 {
+		config.KeepAliveTime = 30 * time.Second
 	}
 
 	client := &Client{
@@ -274,32 +293,93 @@ func (c *Client) handleConnection(connectionID uuid.UUID) {
 	}
 	defer localConn.Close()
 
-	c.logInfo("新连接建立，开始代理数据")
+	c.logDebug("新连接建立，开始代理数据")
 
 	// 开始代理数据
 	c.proxy(localConn, conn)
 }
 
-// proxy 代理数据流
+// proxy 代理数据流（改进版本，支持缓冲区管理）
 func (c *Client) proxy(conn1, conn2 net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// 从conn1复制到conn2
+	// 设置TCP Keep-Alive
+	if c.config.KeepAlive {
+		if tcpConn1, ok := conn1.(*net.TCPConn); ok {
+			tcpConn1.SetKeepAlive(true)
+			tcpConn1.SetKeepAlivePeriod(c.config.KeepAliveTime)
+		}
+		if tcpConn2, ok := conn2.(*net.TCPConn); ok {
+			tcpConn2.SetKeepAlive(true)
+			tcpConn2.SetKeepAlivePeriod(c.config.KeepAliveTime)
+		}
+	}
+
+	// 从conn1复制到conn2（带缓冲区管理）
 	go func() {
 		defer wg.Done()
-		io.Copy(conn2, conn1)
-		conn2.Close()
+		defer conn2.Close()
+
+		buffer := make([]byte, c.config.BufferSize)
+		for {
+			// 设置读取超时
+			conn1.SetReadDeadline(time.Now().Add(c.config.ReadTimeout))
+
+			n, err := conn1.Read(buffer)
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					// 超时，继续读取
+					continue
+				}
+				c.logDebug("连接1读取结束", "error", err)
+				return
+			}
+
+			// 设置写入超时
+			conn2.SetWriteDeadline(time.Now().Add(c.config.WriteTimeout))
+
+			_, err = conn2.Write(buffer[:n])
+			if err != nil {
+				c.logError("连接2写入失败", "error", err)
+				return
+			}
+		}
 	}()
 
-	// 从conn2复制到conn1
+	// 从conn2复制到conn1（带缓冲区管理）
 	go func() {
 		defer wg.Done()
-		io.Copy(conn1, conn2)
-		conn1.Close()
+		defer conn1.Close()
+
+		buffer := make([]byte, c.config.BufferSize)
+		for {
+			// 设置读取超时
+			conn2.SetReadDeadline(time.Now().Add(c.config.ReadTimeout))
+
+			n, err := conn2.Read(buffer)
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					// 超时，继续读取
+					continue
+				}
+				c.logDebug("连接2读取结束", "error", err)
+				return
+			}
+
+			// 设置写入超时
+			conn1.SetWriteDeadline(time.Now().Add(c.config.WriteTimeout))
+
+			_, err = conn1.Write(buffer[:n])
+			if err != nil {
+				c.logError("连接1写入失败", "error", err)
+				return
+			}
+		}
 	}()
 
 	wg.Wait()
+	c.logDebug("代理连接结束")
 }
 
 // GetRemotePort 获取远程端口
@@ -433,16 +513,16 @@ func NewAuthenticator(secret string) *Authenticator {
 
 // ClientHandshake 客户端认证握手
 func (a *Authenticator) ClientHandshake(conn net.Conn) error {
-	// 接收挑战 - 使用自定义的recvMessage方法
+	// 接受连接 - 使用自定义的recvMessage方法
 	var serverMsg ServerMessage
 	if err := a.recvMessage(conn, &serverMsg); err != nil {
-		return fmt.Errorf("接收挑战失败: %w", err)
+		return fmt.Errorf("接收连接失败: %w", err)
 	}
 
 	// 调试信息已移除
 
 	if serverMsg.Challenge == nil {
-		return fmt.Errorf("期望挑战消息，但收到其他消息")
+		return fmt.Errorf("期望连接消息，但收到其他消息")
 	}
 
 	// 生成响应
@@ -488,9 +568,30 @@ func (a *Authenticator) recvMessage(conn net.Conn, msg interface{}) error {
 	return json.Unmarshal(data, msg)
 }
 
-// answerChallenge 回答挑战
+// answerChallenge 回答连接
 func (a *Authenticator) answerChallenge(challenge uuid.UUID) string {
 	h := hmac.New(sha256.New, a.secret)
 	h.Write(challenge[:])
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// WithBufferConfig 设置缓冲区配置
+func (c *ClientConfig) WithBufferConfig(bufferSize int, readTimeout, writeTimeout time.Duration) *ClientConfig {
+	c.BufferSize = bufferSize
+	c.ReadTimeout = readTimeout
+	c.WriteTimeout = writeTimeout
+	return c
+}
+
+// WithKeepAlive 设置TCP Keep-Alive
+func (c *ClientConfig) WithKeepAlive(keepAliveTime time.Duration) *ClientConfig {
+	c.KeepAlive = true
+	c.KeepAliveTime = keepAliveTime
+	return c
+}
+
+// WithLogger 设置日志记录器
+func (c *ClientConfig) WithLogger(logger *slog.Logger) *ClientConfig {
+	c.Logger = logger
+	return c
 }
