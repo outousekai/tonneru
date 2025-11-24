@@ -158,6 +158,9 @@ func (c *Client) connectOnce() error {
 			return fmt.Errorf("认证失败: %w", err)
 		}
 	}
+	if c.config.RemotePort == 0 && c.GetRemotePort() != 0 {
+		c.config.RemotePort = c.GetRemotePort()
+	}
 
 	// 发送Hello消息
 	var helloData HelloMsg
