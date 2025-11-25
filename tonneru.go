@@ -392,6 +392,13 @@ func (c *Client) GetRemotePort() int {
 	return c.remotePort
 }
 
+// GetRemoteHost 获取远程主机
+func (c *Client) GetRemoteHost() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.config.RemoteHost
+}
+
 // Close 关闭连接
 func (c *Client) Close() error {
 	if c.conn != nil {
